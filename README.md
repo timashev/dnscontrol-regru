@@ -148,7 +148,7 @@ test:
 
 ```sh
 # creds.json uses {"username":"test","password":"test"}
-./dnscontrol get-zones test REGRU test.ru
+./dnscontrol get-zones regru test.ru
 ./dnscontrol preview
 ```
 
