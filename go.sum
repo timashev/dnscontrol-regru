@@ -1,0 +1,4 @@
+github.com/DNSControl/dnscontrol/v4 v4.42.0 h1:tmLwCeEre6O9hKv23xjBihqGc4HXCe5/iUPCde6WkT4=
+github.com/DNSControl/dnscontrol/v4 v4.42.0/go.mod h1:Fu+Jej5awn6PsJQxspSp86kf7P8VoVFdWYWxySxTkXs=
+golang.org/x/time v0.15.0 h1:bbrp8t3bGUeFOx08pvsMYRTCVSMk89u4tKbNOZbp88U=
+golang.org/x/time v0.15.0/go.mod h1:Y4YMaQmXwGQZoFaVFk4YpCt4FLQMYKZe9oeV/f4MSno=
