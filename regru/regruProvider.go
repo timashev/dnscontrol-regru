@@ -201,7 +201,6 @@ func (p *regruProvider) GetZoneRecordsCorrections(dc *models.DomainConfig, exist
 func (p *regruProvider) perRecordCorrections(dname string, changes []recordChange) []*models.Correction {
 	var corrections []*models.Correction
 	for _, ch := range changes {
-		ch := ch
 		corrections = append(corrections, &models.Correction{
 			Msg: ch.msg,
 			F: func() error {

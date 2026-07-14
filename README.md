@@ -95,12 +95,22 @@ The same entry serves both the registrar and the DNS service provider.
 
 ## Rate limits
 
-REG.API allows **1200 requests/hour per account and per IP**. The provider adds
-a client-side limiter (default 1 request/second) and retries with exponential
-backoff (up to 5 attempts) on the `IP_EXCEEDED_ALLOWED_CONNECTION_RATE` and
-`ACCOUNT_EXCEEDED_ALLOWED_CONNECTION_RATE` error codes and on HTTP 429/5xx.
-Because the account and per-IP quota is a single shared bucket, the provider does
-not run zones concurrently.
+REG.API allows **1200 requests/hour per account and per IP** — a single shared
+bucket. The provider's client-side limiter is set to that sustained ceiling
+(≈0.333 request/second, i.e. ≈1200 operations/hour) with a small burst.
+
+In the default per-record (client-tier) mode each record change is one API call,
+so the **first large push is deliberately slow**: a zone with hundreds of records
+is paced at ≈1200 operations/hour to stay within quota. The `api_tier: partner`
+batch mode is the fast path — an entire zone's changes go in one (chunked)
+`zone/update_records` call.
+
+Requests are retried with exponential backoff (up to 5 attempts). **Read** calls
+retry on rate-limit rejections and transient transport failures (HTTP 429/5xx,
+network errors). **Write** calls retry **only** on pre-application rate-limit
+rejections (HTTP 429 and the `*_EXCEEDED_ALLOWED_CONNECTION_RATE` codes) — never
+on 5xx or a dropped connection, since a lost response could mean the write
+already applied. Zones are processed serially.
 
 ## Limitations
 
@@ -126,7 +136,9 @@ not run zones concurrently.
   any mismatch.
 - **SRV service label.** REG.API's `add_srv` takes a `service` field (e.g.
   `sip.tcp`) rather than a subdomain; the provider derives it from the SRV owner
-  label (`_sip._tcp`) by stripping underscores.
+  label (`_sip._tcp`) by stripping underscores. SRV is therefore supported only
+  at `_service._proto` owners; deeper owners (e.g. `_sip._tcp.dept`) are rejected
+  by the record auditor since REG.API cannot represent them.
 
 ## Test account
 

@@ -145,6 +145,23 @@ func TestNSSetsEqual(t *testing.T) {
 	}
 }
 
+func TestUpdateNameserversEmptyRejected(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(updateNSSResp))
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	if err := c.updateNameservers("test.ru", nil); err == nil {
+		t.Fatal("expected error for empty NS set")
+	}
+	if calls.Load() != 0 {
+		t.Errorf("update_nss called %d times, want 0 (must not hit the API)", calls.Load())
+	}
+}
+
 func TestUpdateNameserversMapsIndices(t *testing.T) {
 	var captured struct {
 		NSS map[string]string `json:"nss"`

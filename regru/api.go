@@ -27,10 +27,17 @@ const (
 	// including the first attempt.
 	defaultMaxAttempts = 5
 
-	// defaultRateLimit is the client-side request rate (requests per second).
-	// REG.API allows 1200 req/hr per account and per IP; 1 req/s stays well
-	// under both ceilings.
-	defaultRateLimit = 1.0
+	// defaultRateLimit is the client-side sustained request rate (requests per
+	// second). REG.API allows 1200 req/hr per account AND per IP — a single
+	// shared bucket — so the sustained rate is held at exactly that ceiling
+	// (1200/3600 ≈ 0.333 req/s). A faster rate (e.g. 1 req/s = 3600/hr) would
+	// exhaust the hourly quota mid-run; backoff cannot outwait an hourly window,
+	// so a large per-record push would abort with a partially applied zone.
+	defaultRateLimit = 1200.0 / 3600.0
+
+	// defaultBurst lets short bursts absorb latency without exceeding the
+	// sustained ceiling over time.
+	defaultBurst = 5
 
 	// defaultRetryBaseDelay is the first backoff delay; it doubles each retry.
 	defaultRetryBaseDelay = 1 * time.Second
@@ -42,11 +49,35 @@ const (
 	httpTimeout = 30 * time.Second
 )
 
-// Envelope error codes REG.API returns when a rate limit is hit. Both are
-// retriable.
+// Envelope error codes REG.API returns when a rate limit is hit. Both mean the
+// request was rejected before being applied, so both are always retriable.
 const (
 	errIPExceeded      = "IP_EXCEEDED_ALLOWED_CONNECTION_RATE"
 	errAccountExceeded = "ACCOUNT_EXCEEDED_ALLOWED_CONNECTION_RATE"
+)
+
+// Envelope error codes meaning the zone/domain has no manageable DNS service on
+// this account. Surfaced with actionable guidance from GetZoneRecords.
+const (
+	errDomainNotFound  = "DOMAIN_NOT_FOUND"
+	errServiceNotFound = "SERVICE_NOT_FOUND"
+)
+
+// retryPolicy controls whether transport-level failures (HTTP 5xx and network
+// errors) are retried. Rate-limit rejections (HTTP 429 and the *_EXCEEDED_*
+// envelope codes) are retried under both policies because the request is
+// rejected before it is applied.
+type retryPolicy int
+
+const (
+	// retryTransient is for read calls: a lost or 5xx response is harmless to
+	// repeat, so retry transport failures too.
+	retryTransient retryPolicy = iota
+	// retryRateLimitOnly is for write calls: a 5xx or dropped connection may
+	// mean the write was applied but the response was lost, so retrying could
+	// double-apply or surface a false failure. Only pre-application rate-limit
+	// rejections are retried.
+	retryRateLimitOnly
 )
 
 // regruClient talks to REG.API v2. It is safe for use across goroutines only to
@@ -100,7 +131,7 @@ func newClient(m map[string]string) (*regruClient, error) {
 		password:       password,
 		endpoint:       defaultEndpoint,
 		httpClient:     &http.Client{Timeout: httpTimeout},
-		limiter:        rate.NewLimiter(rate.Limit(defaultRateLimit), 1),
+		limiter:        rate.NewLimiter(rate.Limit(defaultRateLimit), defaultBurst),
 		partnerTier:    partnerTier,
 		maxAttempts:    defaultMaxAttempts,
 		retryBaseDelay: defaultRetryBaseDelay,
@@ -111,8 +142,9 @@ func newClient(m map[string]string) (*regruClient, error) {
 // parameter, and decodes the envelope's answer into out (which may be nil when
 // the answer is not needed). Envelope errors are mapped to
 // "regru: <fn>: <code>: <text>". The call is rate limited and retried with
-// exponential backoff on rate-limit envelope codes and on HTTP 429/5xx.
-func (c *regruClient) apiCall(fn string, input any, out any) error {
+// exponential backoff; policy decides whether transport failures are retried
+// (see retryPolicy). Rate-limit rejections are always retried.
+func (c *regruClient) apiCall(fn string, input any, out any, policy retryPolicy) error {
 	if input == nil {
 		input = struct{}{}
 	}
@@ -139,7 +171,7 @@ func (c *regruClient) apiCall(fn string, input any, out any) error {
 			return fmt.Errorf("regru: %s: %w", fn, err)
 		}
 
-		retriable, err := c.doAttempt(endpoint, fn, body, out)
+		retriable, err := c.doAttempt(endpoint, fn, body, out, policy)
 		if err == nil {
 			return nil
 		}
@@ -153,8 +185,8 @@ func (c *regruClient) apiCall(fn string, input any, out any) error {
 }
 
 // doAttempt performs one HTTP request. It reports whether the error (if any) is
-// worth retrying.
-func (c *regruClient) doAttempt(endpoint, fn, body string, out any) (retriable bool, err error) {
+// worth retrying under the given policy.
+func (c *regruClient) doAttempt(endpoint, fn, body string, out any, policy retryPolicy) (retriable bool, err error) {
 	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(body))
 	if err != nil {
 		return false, fmt.Errorf("regru: %s: %w", fn, err)
@@ -163,19 +195,24 @@ func (c *regruClient) doAttempt(endpoint, fn, body string, out any) (retriable b
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		// Transport-level failures (timeouts, connection resets) are transient.
-		return true, fmt.Errorf("regru: %s: %w", fn, err)
+		// Transport-level failure (timeout, connection reset). The request may
+		// have reached the server, so only reads retry.
+		return policy == retryTransient, fmt.Errorf("regru: %s: %w", fn, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return true, fmt.Errorf("regru: %s: reading response: %w", fn, err)
+		return policy == retryTransient, fmt.Errorf("regru: %s: reading response: %w", fn, err)
 	}
 
 	switch {
-	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+	case resp.StatusCode == http.StatusTooManyRequests:
+		// Rate limited before the request was applied — always safe to retry.
 		return true, fmt.Errorf("regru: %s: HTTP %d", fn, resp.StatusCode)
+	case resp.StatusCode >= 500:
+		// The server may have applied a write before the 5xx; only reads retry.
+		return policy == retryTransient, fmt.Errorf("regru: %s: HTTP %d", fn, resp.StatusCode)
 	case resp.StatusCode != http.StatusOK:
 		return false, fmt.Errorf("regru: %s: HTTP %d", fn, resp.StatusCode)
 	}
@@ -186,6 +223,7 @@ func (c *regruClient) doAttempt(endpoint, fn, body string, out any) (retriable b
 	}
 
 	if env.Result != "success" {
+		// The *_EXCEEDED_* codes are pre-application rejections — always retry.
 		retriable := env.ErrorCode == errIPExceeded || env.ErrorCode == errAccountExceeded
 		return retriable, fmt.Errorf("regru: %s: %s: %s", fn, env.ErrorCode, env.ErrorText)
 	}
@@ -256,7 +294,7 @@ type getRecordsResponse struct {
 func (c *regruClient) getResourceRecords(dname string) (*domainRecords, error) {
 	in := getRecordsRequest{Domains: []domainRef{{DName: dname}}}
 	var out getRecordsResponse
-	if err := c.apiCall("zone/get_resource_records", in, &out); err != nil {
+	if err := c.apiCall("zone/get_resource_records", in, &out, retryTransient); err != nil {
 		return nil, err
 	}
 	if len(out.Domains) == 0 {
@@ -264,6 +302,9 @@ func (c *regruClient) getResourceRecords(dname string) (*domainRecords, error) {
 	}
 	d := out.Domains[0]
 	if d.Result != "success" {
+		if d.ErrorCode == errDomainNotFound || d.ErrorCode == errServiceNotFound {
+			return nil, fmt.Errorf("regru: zone %q has no DNS-hosting service on this REG.RU account (%s: %s): create the DNS hosting service for the domain in the REG.RU control panel, or verify the account owns the domain, then re-run", dname, d.ErrorCode, d.ErrorText)
+		}
 		return nil, fmt.Errorf("regru: zone/get_resource_records: %s: %s: %s", dname, d.ErrorCode, d.ErrorText)
 	}
 	return &d, nil
@@ -282,7 +323,7 @@ type serviceListResponse struct {
 // listServices returns every service on the account (domains, hosting, etc.).
 func (c *regruClient) listServices() ([]service, error) {
 	var out serviceListResponse
-	if err := c.apiCall("service/get_list", struct{}{}, &out); err != nil {
+	if err := c.apiCall("service/get_list", struct{}{}, &out, retryTransient); err != nil {
 		return nil, err
 	}
 	return out.Services, nil
@@ -319,7 +360,7 @@ func (c *regruClient) applyRecordAction(dname string, act recordAction) error {
 		payload[k] = v
 	}
 	var out zoneOpResponse
-	if err := c.apiCall(fn, payload, &out); err != nil {
+	if err := c.apiCall(fn, payload, &out, retryRateLimitOnly); err != nil {
 		return err
 	}
 	if len(out.Domains) == 0 {
@@ -366,7 +407,7 @@ type updateRecordsResponse struct {
 func (c *regruClient) updateRecords(dname string, actions []recordAction) error {
 	in := updateRecordsRequest{Domains: []updateDomain{{DName: dname, ActionList: actions}}}
 	var out updateRecordsResponse
-	if err := c.apiCall("zone/update_records", in, &out); err != nil {
+	if err := c.apiCall("zone/update_records", in, &out, retryRateLimitOnly); err != nil {
 		return err
 	}
 	if len(out.Domains) == 0 {
@@ -404,7 +445,7 @@ type getNSSResponse struct {
 func (c *regruClient) getNameservers(dname string) ([]string, error) {
 	in := getRecordsRequest{Domains: []domainRef{{DName: dname}}}
 	var out getNSSResponse
-	if err := c.apiCall("domain/get_nss", in, &out); err != nil {
+	if err := c.apiCall("domain/get_nss", in, &out, retryTransient); err != nil {
 		return nil, err
 	}
 	if len(out.Domains) == 0 {
@@ -439,13 +480,18 @@ type updateNSSResponse struct {
 // updateNameservers sets a domain's delegation nameservers. The names are
 // mapped to REG.API's ns0..nsN fields in the given priority order.
 func (c *regruClient) updateNameservers(dname string, ns []string) error {
+	if len(ns) == 0 {
+		// Defense against wiping delegation if upstream's no-nameservers skip
+		// ever changes. Removing all NS would deregister the domain's DNS.
+		return fmt.Errorf("regru: domain/update_nss: refusing to set an empty NS set for %q", dname)
+	}
 	nss := make(map[string]string, len(ns))
 	for i, n := range ns {
 		nss[fmt.Sprintf("ns%d", i)] = n
 	}
 	in := updateNSSRequest{Domains: []domainRef{{DName: dname}}, NSS: nss}
 	var out updateNSSResponse
-	if err := c.apiCall("domain/update_nss", in, &out); err != nil {
+	if err := c.apiCall("domain/update_nss", in, &out, retryRateLimitOnly); err != nil {
 		return err
 	}
 	if len(out.Domains) == 0 {

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -125,6 +127,31 @@ func TestGetZoneRecordsDomainError(t *testing.T) {
 	_, err := p.GetZoneRecords(&models.DomainConfig{Name: "nope.ru"})
 	if err == nil {
 		t.Fatal("expected error for per-domain NO_SUCH_DOMAIN")
+	}
+}
+
+// DOMAIN_NOT_FOUND / SERVICE_NOT_FOUND get actionable guidance pointing at the
+// reg.ru control panel (closes the spec's EnsureZoneExists intent).
+func TestGetZoneRecordsNoServiceGuidance(t *testing.T) {
+	for _, code := range []string{"DOMAIN_NOT_FOUND", "SERVICE_NOT_FOUND"} {
+		t.Run(code, func(t *testing.T) {
+			resp := `{"answer":{"domains":[{"dname":"absent.ru","result":"error","error_code":"` + code + `","error_text":"not found"}]},"result":"success"}`
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(resp))
+			}))
+			defer srv.Close()
+
+			p := newTestProvider(t, srv.URL)
+			_, err := p.GetZoneRecords(&models.DomainConfig{Name: "absent.ru"})
+			if err == nil {
+				t.Fatalf("expected error for %s", code)
+			}
+			for _, want := range []string{"control panel", code, "absent.ru"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q missing %q", err.Error(), want)
+				}
+			}
+		})
 	}
 }
 
@@ -340,7 +367,7 @@ func manyCreates(t *testing.T, origin string, n int) *models.DomainConfig {
 	var desired models.Records
 	for i := 0; i < n; i++ {
 		rc := &models.RecordConfig{Type: "TXT"}
-		rc.SetLabel("n"+itoaTest(i), origin)
+		rc.SetLabel("n"+strconv.Itoa(i), origin)
 		_ = rc.SetTargetTXT("v")
 		desired = append(desired, rc)
 	}
@@ -406,17 +433,4 @@ func TestGetZoneRecordsCorrectionsPerRecordManyCalls(t *testing.T) {
 	if calls.Load() != 150 {
 		t.Fatalf("calls = %d, want 150", calls.Load())
 	}
-}
-
-// itoaTest avoids importing strconv in the test for one call site.
-func itoaTest(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var b []byte
-	for i > 0 {
-		b = append([]byte{byte('0' + i%10)}, b...)
-		i /= 10
-	}
-	return string(b)
 }

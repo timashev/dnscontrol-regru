@@ -1,6 +1,7 @@
 package regru
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -123,7 +124,7 @@ func TestAPICallSuccess(t *testing.T) {
 	c := testClient(t, srv.URL)
 
 	var out answer
-	err := c.apiCall("zone/get_resource_records", map[string]string{"dname": "xn--e1aybc.xn--p1ai"}, &out)
+	err := c.apiCall("zone/get_resource_records", map[string]string{"dname": "xn--e1aybc.xn--p1ai"}, &out, retryTransient)
 	if err != nil {
 		t.Fatalf("apiCall: %v", err)
 	}
@@ -163,7 +164,7 @@ func TestAPICallNilInput(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t, srv.URL)
-	if err := c.apiCall("zone/clear", nil, nil); err != nil {
+	if err := c.apiCall("zone/clear", nil, nil, retryTransient); err != nil {
 		t.Fatalf("apiCall: %v", err)
 	}
 	if gotInputData != "{}" {
@@ -178,7 +179,7 @@ func TestAPICallAPIError(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t, srv.URL)
-	err := c.apiCall("zone/get_resource_records", map[string]string{"dname": "nope.ru"}, nil)
+	err := c.apiCall("zone/get_resource_records", map[string]string{"dname": "nope.ru"}, nil, retryTransient)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -200,7 +201,7 @@ func TestAPICallMalformedJSON(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t, srv.URL)
-	err := c.apiCall("zone/get_resource_records", nil, nil)
+	err := c.apiCall("zone/get_resource_records", nil, nil, retryTransient)
 	if err == nil {
 		t.Fatal("expected error for malformed JSON")
 	}
@@ -256,7 +257,7 @@ func TestAPICallRateLimitRetry(t *testing.T) {
 			var out struct {
 				OK string `json:"ok"`
 			}
-			if err := c.apiCall("zone/get_resource_records", nil, &out); err != nil {
+			if err := c.apiCall("zone/get_resource_records", nil, &out, retryTransient); err != nil {
 				t.Fatalf("apiCall: %v", err)
 			}
 			if n := calls.Load(); n != 3 {
@@ -278,11 +279,129 @@ func TestAPICallRetriesExhausted(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t, srv.URL)
-	err := c.apiCall("zone/get_resource_records", nil, nil)
+	err := c.apiCall("zone/get_resource_records", nil, nil, retryTransient)
 	if err == nil {
 		t.Fatal("expected error after exhausting retries")
 	}
 	if n := calls.Load(); n != int32(c.maxAttempts) {
 		t.Errorf("calls = %d, want %d (maxAttempts)", n, c.maxAttempts)
 	}
+}
+
+// Write calls must NOT retry on 5xx: a lost response may mean the write already
+// applied, so retrying risks double-applying.
+func TestAPICallWriteNoRetryOn5xx(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	err := c.apiCall("zone/add_alias", nil, nil, retryRateLimitOnly)
+	if err == nil {
+		t.Fatal("expected error surfaced for write + 502")
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("calls = %d, want 1 (writes must not retry on 5xx)", n)
+	}
+}
+
+// Write calls DO retry on HTTP 429 (rate limited before the write was applied).
+func TestAPICallWriteRetriesOn429(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) < 3 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":"success","answer":{}}`))
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	if err := c.apiCall("zone/add_alias", nil, nil, retryRateLimitOnly); err != nil {
+		t.Fatalf("apiCall: %v", err)
+	}
+	if n := calls.Load(); n != 3 {
+		t.Errorf("calls = %d, want 3 (429 retried then success)", n)
+	}
+}
+
+// Write calls also retry on the *_EXCEEDED_* envelope codes (pre-application).
+func TestAPICallWriteRetriesOnEnvelopeExceeded(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) < 3 {
+			_, _ = w.Write([]byte(`{"result":"error","error_code":"ACCOUNT_EXCEEDED_ALLOWED_CONNECTION_RATE","error_text":"slow down"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":"success","answer":{}}`))
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	if err := c.apiCall("zone/remove_record", nil, nil, retryRateLimitOnly); err != nil {
+		t.Fatalf("apiCall: %v", err)
+	}
+	if n := calls.Load(); n != 3 {
+		t.Errorf("calls = %d, want 3 (EXCEEDED retried then success)", n)
+	}
+}
+
+// Read calls retry on 5xx (safe to repeat).
+func TestAPICallReadRetriesOn5xx(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) < 3 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":"success","answer":{}}`))
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	if err := c.apiCall("zone/get_resource_records", nil, nil, retryTransient); err != nil {
+		t.Fatalf("apiCall: %v", err)
+	}
+	if n := calls.Load(); n != 3 {
+		t.Errorf("calls = %d, want 3 (read retries on 5xx)", n)
+	}
+}
+
+// countingErrTransport fails every request and counts attempts, exercising the
+// transport-error branch without a live socket.
+type countingErrTransport struct{ calls *atomic.Int32 }
+
+func (t countingErrTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	t.calls.Add(1)
+	return nil, errors.New("simulated transport failure")
+}
+
+func TestAPICallTransportErrorRetryByPolicy(t *testing.T) {
+	t.Run("write does not retry transport error", func(t *testing.T) {
+		var calls atomic.Int32
+		c := testClient(t, "http://unused")
+		c.httpClient = &http.Client{Transport: countingErrTransport{&calls}}
+		if err := c.apiCall("zone/add_alias", nil, nil, retryRateLimitOnly); err == nil {
+			t.Fatal("expected transport error")
+		}
+		if n := calls.Load(); n != 1 {
+			t.Errorf("calls = %d, want 1", n)
+		}
+	})
+
+	t.Run("read retries transport error", func(t *testing.T) {
+		var calls atomic.Int32
+		c := testClient(t, "http://unused")
+		c.httpClient = &http.Client{Transport: countingErrTransport{&calls}}
+		if err := c.apiCall("zone/get_resource_records", nil, nil, retryTransient); err == nil {
+			t.Fatal("expected transport error")
+		}
+		if n := calls.Load(); n != int32(c.maxAttempts) {
+			t.Errorf("calls = %d, want %d (maxAttempts)", n, c.maxAttempts)
+		}
+	})
 }

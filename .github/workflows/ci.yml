@@ -34,6 +34,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # v8 supports golangci-lint >= v2.1.0 (v6 is golangci-lint v1 only).
+        uses: golangci/golangci-lint-action@v8
         with:
           version: v2.12.2

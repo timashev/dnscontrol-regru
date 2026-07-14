@@ -109,11 +109,18 @@ success responses and makes no real changes — useful for smoke testing.
 
 ## Rate limits
 
-REG.API allows 1200 requests/hour per account and per IP. The provider applies a
-client-side limiter (default 1 request/second) and retries with exponential
-backoff (up to 5 attempts) on the `IP_EXCEEDED_ALLOWED_CONNECTION_RATE` /
-`ACCOUNT_EXCEEDED_ALLOWED_CONNECTION_RATE` error codes and HTTP 429/5xx. The
-account/IP quota is a single shared bucket, so zones are processed serially.
+REG.API allows 1200 requests/hour per account and per IP (a single shared
+bucket). The provider's client-side limiter holds the sustained rate at that
+ceiling (≈0.333 req/s ≈ 1200 ops/hour) with a small burst. In the default
+per-record mode a large initial push is deliberately slow (each record is one
+call, paced at ≈1200 ops/hour); `api_tier: partner` batch mode is the fast path.
+
+Requests retry with exponential backoff (up to 5 attempts). Read calls retry on
+rate-limit rejections and transient transport failures (HTTP 429/5xx, network
+errors); write calls retry only on pre-application rate-limit rejections (HTTP
+429 and the `*_EXCEEDED_ALLOWED_CONNECTION_RATE` codes), never on 5xx or a
+dropped connection (a lost response could mean the write applied). Zones are
+processed serially.
 
 ## Limitations
 
@@ -134,4 +141,5 @@ account/IP quota is a single shared bucket, so zones are processed serially.
   in the `prio` field; `flags tag value` for CAA) and has not been verified
   against a live account, because the `test`/`test` account only returns an A
   record. SRV records use REG.API's `service` field derived from the owner label
-  (`_sip._tcp` → `sip.tcp`).
+  (`_sip._tcp` → `sip.tcp`), so SRV is supported only at `_service._proto`
+  owners; deeper owners (e.g. `_sip._tcp.dept`) are rejected by the auditor.
