@@ -28,6 +28,7 @@ type regruProvider struct {
 var (
 	_ providers.DNSServiceProvider = (*regruProvider)(nil)
 	_ providers.ZoneLister         = (*regruProvider)(nil)
+	_ providers.Registrar          = (*regruProvider)(nil)
 )
 
 var features = providers.DocumentationNotes{
@@ -47,11 +48,21 @@ func init() {
 		RecordAuditor: AuditRecords,
 	}
 	providers.RegisterDomainServiceProviderType(providerName, fns, features)
+	providers.RegisterRegistrarType(providerName, newRegistrar)
 	providers.RegisterMaintainer(providerName, "@timashev")
 }
 
 // newDsp builds a REGRU DNS service provider from creds.json.
 func newDsp(m map[string]string, _ json.RawMessage) (providers.DNSServiceProvider, error) {
+	c, err := newClient(m)
+	if err != nil {
+		return nil, err
+	}
+	return &regruProvider{regruClient: c}, nil
+}
+
+// newRegistrar builds a REGRU registrar from creds.json.
+func newRegistrar(m map[string]string) (providers.Registrar, error) {
 	c, err := newClient(m)
 	if err != nil {
 		return nil, err
@@ -103,10 +114,24 @@ func (p *regruProvider) GetZoneRecords(dc *models.DomainConfig) (models.Records,
 	return records, nil
 }
 
+// recordChange is one diff2 change lowered to REG.API actions. For a rrset
+// replace, removes precede adds; a pure create has only adds, a pure delete
+// only removes.
+type recordChange struct {
+	msg     string
+	removes []recordAction
+	adds    []recordAction
+}
+
 // GetZoneRecordsCorrections computes the actions that turn existing into
-// dc.Records and returns a single correction that applies them via chunked
-// zone/update_records calls.
+// dc.Records. By default each change is applied with per-record client-tier
+// calls; with api_tier=partner the actions are batched into chunked
+// zone/update_records requests.
 func (p *regruProvider) GetZoneRecordsCorrections(dc *models.DomainConfig, existing models.Records) ([]*models.Correction, int, error) {
+	// Apex NS are fixed/managed by REG.RU; never manage them as zone records.
+	existing = dropApexNS(existing)
+	dc.Records = dropApexNS(dc.Records)
+
 	// REG.RU has no per-record TTL. Equalize desired TTLs to the zone TTL so a
 	// TTL difference alone never produces a correction.
 	zoneTTL := defaultZoneTTL
@@ -123,8 +148,7 @@ func (p *regruProvider) GetZoneRecordsCorrections(dc *models.DomainConfig, exist
 	}
 
 	var corrections []*models.Correction
-	var deletes, replaces, creates [][]recordAction
-	var msgs []string
+	var deletes, replaces, creates []recordChange
 
 	for _, ch := range changes {
 		switch ch.Type {
@@ -135,39 +159,59 @@ func (p *regruProvider) GetZoneRecordsCorrections(dc *models.DomainConfig, exist
 			if err != nil {
 				return nil, 0, err
 			}
-			creates = append(creates, []recordAction{add})
-			msgs = append(msgs, ch.Msgs...)
+			creates = append(creates, recordChange{msg: ch.MsgsJoined, adds: []recordAction{add}})
 		case diff2.DELETE:
-			deletes = append(deletes, []recordAction{recordToRemoveAction(ch.Old[0])})
-			msgs = append(msgs, ch.Msgs...)
+			deletes = append(deletes, recordChange{msg: ch.MsgsJoined, removes: []recordAction{recordToRemoveAction(ch.Old[0])}})
 		case diff2.CHANGE:
 			// REG.RU cannot modify a record in place; replace = remove old +
-			// add new. Keep the pair together so it lands in one request.
+			// add new, applied in that order for the same rrset.
 			add, err := recordToAddAction(ch.New[0])
 			if err != nil {
 				return nil, 0, err
 			}
-			replaces = append(replaces, []recordAction{recordToRemoveAction(ch.Old[0]), add})
-			msgs = append(msgs, ch.Msgs...)
+			replaces = append(replaces, recordChange{
+				msg:     ch.MsgsJoined,
+				removes: []recordAction{recordToRemoveAction(ch.Old[0])},
+				adds:    []recordAction{add},
+			})
 		default:
 			return nil, 0, fmt.Errorf("regru: unhandled change type %v", ch.Type)
 		}
 	}
 
 	// Order: pure removals first (also handles type swaps at a name), then
-	// same-rrset replaces (each an atomic remove+add pair), then pure creates.
-	var groups [][]recordAction
-	groups = append(groups, deletes...)
-	groups = append(groups, replaces...)
-	groups = append(groups, creates...)
+	// same-rrset replaces (each removals-then-additions), then pure creates.
+	ordered := make([]recordChange, 0, len(deletes)+len(replaces)+len(creates))
+	ordered = append(ordered, deletes...)
+	ordered = append(ordered, replaces...)
+	ordered = append(ordered, creates...)
 
-	if chunks := chunkActions(groups, maxActionsPerChunk); len(chunks) > 0 {
-		dname := dc.Name
+	if p.partnerTier {
+		corrections = append(corrections, p.partnerCorrections(dc.Name, ordered)...)
+	} else {
+		corrections = append(corrections, p.perRecordCorrections(dc.Name, ordered)...)
+	}
+
+	return corrections, actualChangeCount, nil
+}
+
+// perRecordCorrections emits one correction per change; each executes its
+// removals immediately followed by its additions as individual client-tier
+// zone/add_* + zone/remove_record calls.
+func (p *regruProvider) perRecordCorrections(dname string, changes []recordChange) []*models.Correction {
+	var corrections []*models.Correction
+	for _, ch := range changes {
+		ch := ch
 		corrections = append(corrections, &models.Correction{
-			Msg: strings.Join(msgs, "\n"),
+			Msg: ch.msg,
 			F: func() error {
-				for _, chunk := range chunks {
-					if err := p.updateRecords(dname, chunk); err != nil {
+				for _, a := range ch.removes {
+					if err := p.applyRecordAction(dname, a); err != nil {
+						return err
+					}
+				}
+				for _, a := range ch.adds {
+					if err := p.applyRecordAction(dname, a); err != nil {
 						return err
 					}
 				}
@@ -175,6 +219,92 @@ func (p *regruProvider) GetZoneRecordsCorrections(dc *models.DomainConfig, exist
 			},
 		})
 	}
+	return corrections
+}
 
-	return corrections, actualChangeCount, nil
+// partnerCorrections batches all actions into chunked zone/update_records
+// requests (partner-tier). Each change is one group (removals then additions)
+// kept intact within a chunk so a replace never splits across requests.
+func (p *regruProvider) partnerCorrections(dname string, changes []recordChange) []*models.Correction {
+	var groups [][]recordAction
+	var msgs []string
+	for _, ch := range changes {
+		group := make([]recordAction, 0, len(ch.removes)+len(ch.adds))
+		group = append(group, ch.removes...)
+		group = append(group, ch.adds...)
+		groups = append(groups, group)
+		msgs = append(msgs, ch.msg)
+	}
+
+	chunks := chunkActions(groups, maxActionsPerChunk)
+	if len(chunks) == 0 {
+		return nil
+	}
+	return []*models.Correction{{
+		Msg: strings.Join(msgs, "\n"),
+		F: func() error {
+			for _, chunk := range chunks {
+				if err := p.updateRecords(dname, chunk); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}}
+}
+
+// GetRegistrarCorrections syncs the domain's delegation nameservers with
+// dc.Nameservers. It emits nothing when the sets match modulo order, case, and
+// trailing dots.
+func (p *regruProvider) GetRegistrarCorrections(dc *models.DomainConfig) ([]*models.Correction, error) {
+	current, err := p.getNameservers(dc.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	desired := make([]string, 0, len(dc.Nameservers))
+	for _, ns := range dc.Nameservers {
+		desired = append(desired, ns.Name)
+	}
+
+	if nsSetsEqual(current, desired) {
+		return nil, nil
+	}
+
+	dname := dc.Name
+	want := desired
+	return []*models.Correction{{
+		Msg: fmt.Sprintf("Update nameservers %s -> %s",
+			strings.Join(sortedNormalizedNS(current), ","),
+			strings.Join(sortedNormalizedNS(want), ",")),
+		F: func() error { return p.updateNameservers(dname, want) },
+	}}, nil
+}
+
+// normalizeNS lowercases and strips a trailing dot for order/case/dot-insensitive
+// nameserver comparison.
+func normalizeNS(s string) string {
+	return strings.ToLower(strings.TrimSuffix(s, "."))
+}
+
+func sortedNormalizedNS(in []string) []string {
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = normalizeNS(s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func nsSetsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	na, nb := sortedNormalizedNS(a), sortedNormalizedNS(b)
+	for i := range na {
+		if na[i] != nb[i] {
+			return false
+		}
+	}
+	return true
 }

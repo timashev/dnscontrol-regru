@@ -59,6 +59,11 @@ type regruClient struct {
 	httpClient *http.Client
 	limiter    *rate.Limiter
 
+	// partnerTier selects the batched zone/update_records execution path
+	// (partner-tier only). When false (the default), corrections are applied
+	// with per-record zone/add_* + zone/remove_record calls (client-tier).
+	partnerTier bool
+
 	maxAttempts    int
 	retryBaseDelay time.Duration
 }
@@ -85,12 +90,18 @@ func newClient(m map[string]string) (*regruClient, error) {
 		return nil, errors.New("regru: missing 'password' in creds.json")
 	}
 
+	// api_tier selects the corrections execution mode. "partner" enables the
+	// batched zone/update_records path; absence or any other value keeps the
+	// default per-record path that works on every account tier.
+	partnerTier := strings.EqualFold(strings.TrimSpace(m["api_tier"]), "partner")
+
 	return &regruClient{
 		username:       username,
 		password:       password,
 		endpoint:       defaultEndpoint,
 		httpClient:     &http.Client{Timeout: httpTimeout},
 		limiter:        rate.NewLimiter(rate.Limit(defaultRateLimit), 1),
+		partnerTier:    partnerTier,
 		maxAttempts:    defaultMaxAttempts,
 		retryBaseDelay: defaultRetryBaseDelay,
 	}, nil
@@ -280,7 +291,46 @@ func (c *regruClient) listServices() ([]service, error) {
 // recordAction is one entry of a zone/update_records action_list. Every value
 // is a string; the "action" key selects the operation (add_alias, add_mx,
 // remove_record, ...). Marshaling a map yields deterministically sorted keys.
+// The same map also drives per-record calls: the "action" value becomes the
+// function suffix and the remaining keys become top-level input_data fields.
 type recordAction map[string]string
+
+// zoneOpResponse is the answer shape shared by the per-record zone functions
+// (zone/add_*, zone/remove_record): a per-domain result with no action_list.
+type zoneOpResponse struct {
+	Domains []struct {
+		DName     string `json:"dname"`
+		Result    string `json:"result"`
+		ErrorCode string `json:"error_code"`
+		ErrorText string `json:"error_text"`
+	} `json:"domains"`
+}
+
+// applyRecordAction executes a single action as an individual client-tier call
+// to zone/<action> (e.g. zone/add_alias, zone/remove_record). The record fields
+// are sent as top-level input_data siblings of "domains".
+func (c *regruClient) applyRecordAction(dname string, act recordAction) error {
+	fn := "zone/" + act["action"]
+	payload := map[string]any{"domains": []domainRef{{DName: dname}}}
+	for k, v := range act {
+		if k == "action" {
+			continue
+		}
+		payload[k] = v
+	}
+	var out zoneOpResponse
+	if err := c.apiCall(fn, payload, &out); err != nil {
+		return err
+	}
+	if len(out.Domains) == 0 {
+		return fmt.Errorf("regru: %s: no data returned for %q", fn, dname)
+	}
+	d := out.Domains[0]
+	if d.Result != "success" {
+		return fmt.Errorf("regru: %s: %s: %s: %s", fn, dname, d.ErrorCode, d.ErrorText)
+	}
+	return nil
+}
 
 type updateDomain struct {
 	DName      string         `json:"dname"`
@@ -330,6 +380,81 @@ func (c *regruClient) updateRecords(dname string, actions []recordAction) error 
 		if a.Result != "success" {
 			return fmt.Errorf("regru: zone/update_records: %s: action %s: %s: %s", dname, a.Action, a.ErrorCode, a.ErrorText)
 		}
+	}
+	return nil
+}
+
+// --- Registrar (nameserver) functions: domain/get_nss, domain/update_nss ---
+
+type nsEntry struct {
+	NS string `json:"ns"`
+}
+
+type domainNSS struct {
+	DName     string    `json:"dname"`
+	ErrorCode string    `json:"error_code"`
+	NSS       []nsEntry `json:"nss"`
+}
+
+type getNSSResponse struct {
+	Domains []domainNSS `json:"domains"`
+}
+
+// getNameservers returns the delegation nameservers currently set for a domain.
+func (c *regruClient) getNameservers(dname string) ([]string, error) {
+	in := getRecordsRequest{Domains: []domainRef{{DName: dname}}}
+	var out getNSSResponse
+	if err := c.apiCall("domain/get_nss", in, &out); err != nil {
+		return nil, err
+	}
+	if len(out.Domains) == 0 {
+		return nil, fmt.Errorf("regru: domain/get_nss: no data returned for %q", dname)
+	}
+	d := out.Domains[0]
+	if d.ErrorCode != "" {
+		return nil, fmt.Errorf("regru: domain/get_nss: %s: %s", dname, d.ErrorCode)
+	}
+	nss := make([]string, 0, len(d.NSS))
+	for _, e := range d.NSS {
+		if e.NS != "" {
+			nss = append(nss, e.NS)
+		}
+	}
+	return nss, nil
+}
+
+type updateNSSRequest struct {
+	Domains []domainRef       `json:"domains"`
+	NSS     map[string]string `json:"nss"`
+}
+
+type updateNSSResponse struct {
+	Domains []struct {
+		DName     string `json:"dname"`
+		Result    string `json:"result"`
+		ErrorCode string `json:"error_code"`
+	} `json:"domains"`
+}
+
+// updateNameservers sets a domain's delegation nameservers. The names are
+// mapped to REG.API's ns0..nsN fields in the given priority order.
+func (c *regruClient) updateNameservers(dname string, ns []string) error {
+	nss := make(map[string]string, len(ns))
+	for i, n := range ns {
+		nss[fmt.Sprintf("ns%d", i)] = n
+	}
+	in := updateNSSRequest{Domains: []domainRef{{DName: dname}}, NSS: nss}
+	var out updateNSSResponse
+	if err := c.apiCall("domain/update_nss", in, &out); err != nil {
+		return err
+	}
+	if len(out.Domains) == 0 {
+		return fmt.Errorf("regru: domain/update_nss: no data returned for %q", dname)
+	}
+	d := out.Domains[0]
+	// On error REG.API puts the code in error_code and the message in result.
+	if d.ErrorCode != "" || d.Result != "success" {
+		return fmt.Errorf("regru: domain/update_nss: %s: %s: %s", dname, d.ErrorCode, d.Result)
 	}
 	return nil
 }

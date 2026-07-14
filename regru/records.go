@@ -90,11 +90,14 @@ func nativeToRecordConfig(origin string, rr *nativeRR, ttl uint32) (*models.Reco
 	case "TXT":
 		err = rc.SetTargetTXT(rr.Content)
 	case "SRV":
-		// Assumed content shape: "weight port target" (priority is the prio
-		// field). Verify against a live account in the smoke test (brief 003).
+		// Content shape ASSUMED "weight port target" (priority = prio field).
+		// Verified against test/test: only an A record is returned, so the SRV
+		// read shape is unverified — confirm on a live account (smoke test /
+		// docs Limitations). The write path (add_srv) uses documented fields.
 		err = rc.SetTargetSRVPriorityString(uint16(prio), ensureDotSRVTarget(rr.Content))
 	case "CAA":
-		// Assumed content shape: `flags tag value` (optionally quoted value).
+		// Content shape ASSUMED `flags tag value` (value optionally quoted).
+		// Same verification caveat as SRV: unconfirmed against test/test.
 		err = rc.SetTargetCAAString(rr.Content)
 	default:
 		// SOA and any record type this provider does not manage are skipped.
@@ -104,6 +107,25 @@ func nativeToRecordConfig(origin string, rr *nativeRR, ttl uint32) (*models.Reco
 		return nil, fmt.Errorf("regru: parsing %s record %q: %w", rr.Rectype, rr.Subname, err)
 	}
 	return rc, nil
+}
+
+// dropApexNS removes apex NS records (label "@") from a record set. REG.RU's
+// nameservers are a fixed set managed by REG.RU itself; the provider never
+// creates or deletes apex NS as zone records (delegation is handled by the
+// registrar role via domain/update_nss). dnscontrol injects the provider
+// nameservers as desired apex NS via nameservers.AddNSRecords, and REG.RU's
+// get_resource_records may or may not echo them back — filtering both sides
+// keeps that asymmetry from ever producing a correction. Subdomain NS
+// delegation records are left intact.
+func dropApexNS(records models.Records) models.Records {
+	out := make(models.Records, 0, len(records))
+	for _, r := range records {
+		if r.Type == "NS" && r.GetLabel() == "@" {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // chunkActions groups action-groups into chunks of at most max actions, never

@@ -74,6 +74,32 @@ func TestNewClient(t *testing.T) {
 			t.Fatal("expected error for missing password")
 		}
 	})
+
+	t.Run("api_tier partner enables batch mode", func(t *testing.T) {
+		c, err := newClient(map[string]string{"username": "user", "password": "secret", "api_tier": "partner"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !c.partnerTier {
+			t.Error("partnerTier = false, want true for api_tier=partner")
+		}
+	})
+
+	t.Run("api_tier absent or other defaults to per-record", func(t *testing.T) {
+		for _, v := range []string{"", "client", "whatever"} {
+			m := map[string]string{"username": "user", "password": "secret"}
+			if v != "" {
+				m["api_tier"] = v
+			}
+			c, err := newClient(m)
+			if err != nil {
+				t.Fatalf("api_tier=%q: %v", v, err)
+			}
+			if c.partnerTier {
+				t.Errorf("api_tier=%q: partnerTier = true, want false", v)
+			}
+		}
+	})
 }
 
 func TestAPICallSuccess(t *testing.T) {

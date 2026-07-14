@@ -141,7 +141,11 @@ func buildExisting(t *testing.T, origin string, rrs ...*nativeRR) models.Records
 	return recs
 }
 
-func TestGetZoneRecordsCorrectionsGolden(t *testing.T) {
+// goldenScenario returns the shared existing+desired inputs used by both the
+// per-record and partner corrections golden tests: change www, keep MX, add
+// new, drop old.
+func goldenScenario(t *testing.T) (models.Records, *models.DomainConfig) {
+	t.Helper()
 	const origin = "example.com"
 
 	existing := buildExisting(t, origin,
@@ -150,7 +154,6 @@ func TestGetZoneRecordsCorrectionsGolden(t *testing.T) {
 		&nativeRR{Subname: "@", Rectype: "MX", Content: "mail.example.com", Prio: "10"},
 	)
 
-	// Desired: change www, keep MX, add new, drop old.
 	wwwNew := &models.RecordConfig{Type: "A"}
 	wwwNew.SetLabel("www", origin)
 	_ = wwwNew.SetTarget("2.2.2.2")
@@ -164,26 +167,11 @@ func TestGetZoneRecordsCorrectionsGolden(t *testing.T) {
 	_ = newRec.SetTarget("3.3.3.3")
 
 	dc := &models.DomainConfig{Name: origin, Records: models.Records{wwwNew, mxSame, newRec}}
+	return existing, dc
+}
 
-	var captured capturedUpdate
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		decodeInputData(t, r, &captured)
-		_, _ = w.Write([]byte(`{"answer":{"domains":[{"dname":"example.com","result":"success","action_list":[{"action":"remove_record","result":"success"}]}]},"result":"success"}`))
-	}))
-	defer srv.Close()
-
-	p := newTestProvider(t, srv.URL)
-	corrections, count, err := p.GetZoneRecordsCorrections(dc, existing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if count != 3 {
-		t.Errorf("actualChangeCount = %d, want 3", count)
-	}
-
-	// Execute the corrections.
+func runCorrections(t *testing.T, corrections []*models.Correction) {
+	t.Helper()
 	for _, c := range corrections {
 		if c.F != nil {
 			if err := c.F(); err != nil {
@@ -191,11 +179,83 @@ func TestGetZoneRecordsCorrectionsGolden(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestGetZoneRecordsCorrectionsPerRecord is the default mode: each change is a
+// sequence of individual zone/add_* + zone/remove_record calls, removals of a
+// rrset immediately before its additions.
+func TestGetZoneRecordsCorrectionsPerRecord(t *testing.T) {
+	existing, dc := goldenScenario(t)
+
+	var seq []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		seq = append(seq, r.URL.Path+" "+r.Form.Get("input_data"))
+		_, _ = w.Write([]byte(`{"answer":{"domains":[{"dname":"example.com","result":"success"}]},"result":"success"}`))
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL) // default: per-record
+	corrections, count, err := p.GetZoneRecordsCorrections(dc, existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Errorf("actualChangeCount = %d, want 3", count)
+	}
+	runCorrections(t, corrections)
+
+	want := []string{
+		`/zone/remove_record {"content":"9.9.9.9","domains":[{"dname":"example.com"}],"record_type":"A","subdomain":"old"}`,
+		`/zone/remove_record {"content":"1.1.1.1","domains":[{"dname":"example.com"}],"record_type":"A","subdomain":"www"}`,
+		`/zone/add_alias {"domains":[{"dname":"example.com"}],"ipaddr":"2.2.2.2","subdomain":"www"}`,
+		`/zone/add_alias {"domains":[{"dname":"example.com"}],"ipaddr":"3.3.3.3","subdomain":"new"}`,
+	}
+	if len(seq) != len(want) {
+		t.Fatalf("call sequence has %d calls, want %d:\n%v", len(seq), len(want), seq)
+	}
+	for i := range want {
+		if seq[i] != want[i] {
+			t.Errorf("call %d:\n got  %s\n want %s", i, seq[i], want[i])
+		}
+	}
+}
+
+// TestGetZoneRecordsCorrectionsPartner is the api_tier=partner mode: one batched
+// zone/update_records call carrying the full action_list.
+func TestGetZoneRecordsCorrectionsPartner(t *testing.T) {
+	existing, dc := goldenScenario(t)
+
+	var captured capturedUpdate
+	var calls atomic.Int32
+	var path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		path = r.URL.Path
+		decodeInputData(t, r, &captured)
+		_, _ = w.Write([]byte(`{"answer":{"domains":[{"dname":"example.com","result":"success","action_list":[{"action":"remove_record","result":"success"}]}]},"result":"success"}`))
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL)
+	p.partnerTier = true
+
+	corrections, count, err := p.GetZoneRecordsCorrections(dc, existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Errorf("actualChangeCount = %d, want 3", count)
+	}
+	runCorrections(t, corrections)
 
 	if calls.Load() != 1 {
 		t.Fatalf("update_records calls = %d, want 1", calls.Load())
 	}
-	if len(captured.Domains) != 1 || captured.Domains[0].DName != origin {
+	if path != "/zone/update_records" {
+		t.Errorf("path = %q, want /zone/update_records", path)
+	}
+	if len(captured.Domains) != 1 || captured.Domains[0].DName != "example.com" {
 		t.Fatalf("captured domains = %+v", captured.Domains)
 	}
 
@@ -208,6 +268,51 @@ func TestGetZoneRecordsCorrectionsGolden(t *testing.T) {
 		`{"action":"add_alias","ipaddr":"3.3.3.3","subdomain":"new"}]`
 	if string(got) != want {
 		t.Errorf("action_list mismatch:\n got  %s\n want %s", got, want)
+	}
+}
+
+// Apex NS are ignored (fixed reg.ru set), but subdomain NS delegation is
+// still managed.
+func TestGetZoneRecordsCorrectionsApexNSIgnored(t *testing.T) {
+	const origin = "example.com"
+	existing := buildExisting(t, origin,
+		&nativeRR{Subname: "@", Rectype: "NS", Content: "ns1.reg.ru", Prio: "0"},
+		&nativeRR{Subname: "@", Rectype: "NS", Content: "ns2.reg.ru", Prio: "0"},
+	)
+
+	// Desired: apex NS (as dnscontrol's AddNSRecords would inject) + a real
+	// subdomain NS delegation that must be created.
+	apex1 := &models.RecordConfig{Type: "NS"}
+	apex1.SetLabel("@", origin)
+	_ = apex1.SetTarget("ns1.reg.ru.")
+	apex2 := &models.RecordConfig{Type: "NS"}
+	apex2.SetLabel("@", origin)
+	_ = apex2.SetTarget("ns2.reg.ru.")
+	sub := &models.RecordConfig{Type: "NS"}
+	sub.SetLabel("deleg", origin)
+	_ = sub.SetTarget("ns1.other.net.")
+
+	dc := &models.DomainConfig{Name: origin, Records: models.Records{apex1, apex2, sub}}
+
+	var seq []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		seq = append(seq, r.URL.Path)
+		_, _ = w.Write([]byte(`{"answer":{"domains":[{"dname":"example.com","result":"success"}]},"result":"success"}`))
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL)
+	corrections, count, err := p.GetZoneRecordsCorrections(dc, existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Errorf("actualChangeCount = %d, want 1 (only the subdomain NS)", count)
+	}
+	runCorrections(t, corrections)
+	if len(seq) != 1 || seq[0] != "/zone/add_ns" {
+		t.Errorf("calls = %v, want one /zone/add_ns for the subdomain delegation", seq)
 	}
 }
 
@@ -230,17 +335,21 @@ func TestGetZoneRecordsCorrectionsNoChange(t *testing.T) {
 	}
 }
 
-func TestGetZoneRecordsCorrectionsChunking(t *testing.T) {
-	const origin = "example.com"
-	// 150 pure creations -> chunked into 2 update_records calls (100 + 50).
+func manyCreates(t *testing.T, origin string, n int) *models.DomainConfig {
+	t.Helper()
 	var desired models.Records
-	for i := 0; i < 150; i++ {
+	for i := 0; i < n; i++ {
 		rc := &models.RecordConfig{Type: "TXT"}
 		rc.SetLabel("n"+itoaTest(i), origin)
 		_ = rc.SetTargetTXT("v")
 		desired = append(desired, rc)
 	}
-	dc := &models.DomainConfig{Name: origin, Records: desired}
+	return &models.DomainConfig{Name: origin, Records: desired}
+}
+
+// Chunking applies only to the partner (batched) mode.
+func TestGetZoneRecordsCorrectionsPartnerChunking(t *testing.T) {
+	dc := manyCreates(t, "example.com", 150) // -> 2 update_records calls (100 + 50)
 
 	var calls atomic.Int32
 	var sizes []int
@@ -254,6 +363,8 @@ func TestGetZoneRecordsCorrectionsChunking(t *testing.T) {
 	defer srv.Close()
 
 	p := newTestProvider(t, srv.URL)
+	p.partnerTier = true
+
 	corrections, count, err := p.GetZoneRecordsCorrections(dc, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -261,18 +372,39 @@ func TestGetZoneRecordsCorrectionsChunking(t *testing.T) {
 	if count != 150 {
 		t.Errorf("count = %d, want 150", count)
 	}
-	for _, c := range corrections {
-		if c.F != nil {
-			if err := c.F(); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
+	runCorrections(t, corrections)
+
 	if calls.Load() != 2 {
 		t.Fatalf("calls = %d, want 2", calls.Load())
 	}
 	if len(sizes) != 2 || sizes[0] != 100 || sizes[1] != 50 {
 		t.Errorf("chunk sizes = %v, want [100 50]", sizes)
+	}
+}
+
+// Per-record mode does not chunk: N creates -> N individual zone/add_txt calls.
+func TestGetZoneRecordsCorrectionsPerRecordManyCalls(t *testing.T) {
+	dc := manyCreates(t, "example.com", 150)
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path != "/zone/add_txt" {
+			t.Errorf("path = %q, want /zone/add_txt", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"answer":{"domains":[{"dname":"example.com","result":"success"}]},"result":"success"}`))
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL) // default: per-record
+	corrections, _, err := p.GetZoneRecordsCorrections(dc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCorrections(t, corrections)
+
+	if calls.Load() != 150 {
+		t.Fatalf("calls = %d, want 150", calls.Load())
 	}
 }
 
