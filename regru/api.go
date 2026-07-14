@@ -155,7 +155,7 @@ func (c *regruClient) doAttempt(endpoint, fn, body string, out any) (retriable b
 		// Transport-level failures (timeouts, connection resets) are transient.
 		return true, fmt.Errorf("regru: %s: %w", fn, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -195,4 +195,141 @@ func (c *regruClient) backoff(attempt int) time.Duration {
 		return maxRetryDelay
 	}
 	return d
+}
+
+// --- REG.API v2 zone/service function wrappers and their JSON shapes ---
+//
+// The response envelope has a top-level result plus a per-domain result inside
+// answer.domains[]; a domain can fail while the request as a whole reports
+// "success", so per-domain results must always be inspected.
+
+// domainRef identifies a domain in a request. REG.RU expects punycode dnames.
+type domainRef struct {
+	DName string `json:"dname"`
+}
+
+// nativeRR is a single resource record as returned by
+// zone/get_resource_records. REG.RU carries no per-record TTL (the zone SOA TTL
+// governs everything), so there is no TTL field here.
+type nativeRR struct {
+	Subname string `json:"subname"` // relative name: "@" apex, "*" wildcard, or a label
+	Rectype string `json:"rectype"`
+	Content string `json:"content"`
+	Prio    string `json:"prio"` // priority for MX/SRV, "0" otherwise
+	State   string `json:"state"`
+}
+
+type soaInfo struct {
+	TTL        string `json:"ttl"`
+	MinimumTTL string `json:"minimum_ttl"`
+}
+
+type domainRecords struct {
+	DName     string     `json:"dname"`
+	Result    string     `json:"result"`
+	ErrorCode string     `json:"error_code"`
+	ErrorText string     `json:"error_text"`
+	RRs       []nativeRR `json:"rrs"`
+	SOA       soaInfo    `json:"soa"`
+}
+
+type getRecordsRequest struct {
+	Domains []domainRef `json:"domains"`
+}
+
+type getRecordsResponse struct {
+	Domains []domainRecords `json:"domains"`
+}
+
+// getResourceRecords fetches the resource records for a single zone.
+func (c *regruClient) getResourceRecords(dname string) (*domainRecords, error) {
+	in := getRecordsRequest{Domains: []domainRef{{DName: dname}}}
+	var out getRecordsResponse
+	if err := c.apiCall("zone/get_resource_records", in, &out); err != nil {
+		return nil, err
+	}
+	if len(out.Domains) == 0 {
+		return nil, fmt.Errorf("regru: zone/get_resource_records: no data returned for %q", dname)
+	}
+	d := out.Domains[0]
+	if d.Result != "success" {
+		return nil, fmt.Errorf("regru: zone/get_resource_records: %s: %s: %s", dname, d.ErrorCode, d.ErrorText)
+	}
+	return &d, nil
+}
+
+type service struct {
+	DName    string `json:"dname"`
+	Servtype string `json:"servtype"`
+	State    string `json:"state"`
+}
+
+type serviceListResponse struct {
+	Services []service `json:"services"`
+}
+
+// listServices returns every service on the account (domains, hosting, etc.).
+func (c *regruClient) listServices() ([]service, error) {
+	var out serviceListResponse
+	if err := c.apiCall("service/get_list", struct{}{}, &out); err != nil {
+		return nil, err
+	}
+	return out.Services, nil
+}
+
+// recordAction is one entry of a zone/update_records action_list. Every value
+// is a string; the "action" key selects the operation (add_alias, add_mx,
+// remove_record, ...). Marshaling a map yields deterministically sorted keys.
+type recordAction map[string]string
+
+type updateDomain struct {
+	DName      string         `json:"dname"`
+	ActionList []recordAction `json:"action_list"`
+}
+
+type updateRecordsRequest struct {
+	Domains []updateDomain `json:"domains"`
+}
+
+type actionResult struct {
+	Action    string `json:"action"`
+	Result    string `json:"result"`
+	ErrorCode string `json:"error_code"`
+	ErrorText string `json:"error_text"`
+}
+
+type updateDomainResult struct {
+	DName      string         `json:"dname"`
+	Result     string         `json:"result"`
+	ErrorCode  string         `json:"error_code"`
+	ErrorText  string         `json:"error_text"`
+	ActionList []actionResult `json:"action_list"`
+}
+
+type updateRecordsResponse struct {
+	Domains []updateDomainResult `json:"domains"`
+}
+
+// updateRecords applies a batch of add/remove actions to one zone. Both the
+// per-domain result and each per-action result are checked. REG.API stops at
+// the first failing action and ignores the rest, so a partial error is fatal.
+func (c *regruClient) updateRecords(dname string, actions []recordAction) error {
+	in := updateRecordsRequest{Domains: []updateDomain{{DName: dname, ActionList: actions}}}
+	var out updateRecordsResponse
+	if err := c.apiCall("zone/update_records", in, &out); err != nil {
+		return err
+	}
+	if len(out.Domains) == 0 {
+		return fmt.Errorf("regru: zone/update_records: no data returned for %q", dname)
+	}
+	d := out.Domains[0]
+	if d.Result == "error" || d.ErrorCode != "" {
+		return fmt.Errorf("regru: zone/update_records: %s: %s: %s", dname, d.ErrorCode, d.ErrorText)
+	}
+	for _, a := range d.ActionList {
+		if a.Result != "success" {
+			return fmt.Errorf("regru: zone/update_records: %s: action %s: %s: %s", dname, a.Action, a.ErrorCode, a.ErrorText)
+		}
+	}
+	return nil
 }
