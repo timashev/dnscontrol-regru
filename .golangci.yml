@@ -1,0 +1,3 @@
+# Minimal golangci-lint v2 config: use the default linter set explicitly so
+# local runs and CI agree.
+version: "2"

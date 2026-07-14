@@ -1,0 +1,11 @@
+# Build artifacts
+/dnscontrol
+/dnscontrol-*
+*.exe
+
+# Agent scratch / screenshots
+/.scratch/
+/.playwright-mcp/
+
+# Local credentials — never commit real creds
+/creds.json

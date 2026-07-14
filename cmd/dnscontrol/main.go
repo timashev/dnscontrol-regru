@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
+	"strings"
 
 	"github.com/DNSControl/dnscontrol/v4/commands"
 	_ "github.com/DNSControl/dnscontrol/v4/pkg/providers/_all"
@@ -19,6 +20,19 @@ import (
 	_ "github.com/timashev/dnscontrol-regru/regru"
 )
 
+// regruVersion returns dnscontrol's version string marked with "+regru" to
+// identify this REGRU-enabled build. The Makefile injects the marker into the
+// version at build time (-ldflags -X .../pkg/version.version=...+regru), which
+// also makes `dnscontrol version` report it; for plain `go build`/`go install`
+// (no ldflags) we append it here so the banner still reflects the fork.
+func regruVersion() string {
+	v := version.Version()
+	if !strings.Contains(v, "+regru") {
+		v += "+regru"
+	}
+	return v
+}
+
 func main() {
 	if os.Getenv("CI") == "true" {
 		color.NoColor = false
@@ -26,5 +40,5 @@ func main() {
 	if info, ok := debug.ReadBuildInfo(); !ok && info == nil {
 		fmt.Fprint(os.Stderr, "Warning: dnscontrol was built without Go modules. See https://docs.dnscontrol.org/getting-started/getting-started#source for more information on how to build dnscontrol correctly.\n\n")
 	}
-	os.Exit(commands.Run("DNSControl version " + version.Version() + "+regru"))
+	os.Exit(commands.Run("DNSControl version " + regruVersion()))
 }

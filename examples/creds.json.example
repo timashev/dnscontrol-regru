@@ -1,0 +1,7 @@
+{
+  "regru": {
+    "TYPE": "REGRU",
+    "username": "your-reg.ru-username",
+    "password": "your-dedicated-api-password"
+  }
+}
