@@ -257,20 +257,43 @@ type domainRef struct {
 	DName string `json:"dname"`
 }
 
+// flexString decodes a JSON string OR bare number into a string. REG.API is
+// inconsistent across accounts here: the canned test/test account returns
+// fields like "prio" and "soa.ttl" as strings, while real accounts return
+// bare numbers (observed live 2026-07-15: prio as number).
+type flexString string
+
+func (f *flexString) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		*f = flexString(s)
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	*f = flexString(n.String())
+	return nil
+}
+
 // nativeRR is a single resource record as returned by
 // zone/get_resource_records. REG.RU carries no per-record TTL (the zone SOA TTL
 // governs everything), so there is no TTL field here.
 type nativeRR struct {
-	Subname string `json:"subname"` // relative name: "@" apex, "*" wildcard, or a label
-	Rectype string `json:"rectype"`
-	Content string `json:"content"`
-	Prio    string `json:"prio"` // priority for MX/SRV, "0" otherwise
-	State   string `json:"state"`
+	Subname string     `json:"subname"` // relative name: "@" apex, "*" wildcard, or a label
+	Rectype string     `json:"rectype"`
+	Content string     `json:"content"`
+	Prio    flexString `json:"prio"` // priority for MX/SRV, "0" otherwise; string or number on the wire
+	State   string     `json:"state"`
 }
 
 type soaInfo struct {
-	TTL        string `json:"ttl"`
-	MinimumTTL string `json:"minimum_ttl"`
+	TTL        flexString `json:"ttl"` // "3600"/"1d" on test/test; may be a bare number live
+	MinimumTTL flexString `json:"minimum_ttl"`
 }
 
 type domainRecords struct {

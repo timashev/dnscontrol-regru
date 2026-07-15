@@ -98,7 +98,7 @@ func (p *regruProvider) GetZoneRecords(dc *models.DomainConfig) (models.Records,
 	if err != nil {
 		return nil, err
 	}
-	zoneTTL := parseRegruTTL(dom.SOA.TTL)
+	zoneTTL := parseRegruTTL(string(dom.SOA.TTL))
 
 	var records models.Records
 	for i := range dom.RRs {

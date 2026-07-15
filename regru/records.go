@@ -60,7 +60,7 @@ func recordToRemoveAction(rc *models.RecordConfig) recordAction {
 		a["subdomain"] = native.Subname
 		a["content"] = native.Content
 		if native.Prio != "" && (rc.Type == "MX" || rc.Type == "SRV") {
-			a["priority"] = native.Prio
+			a["priority"] = string(native.Prio)
 		}
 	} else {
 		// Fallback (existing records always carry Original in practice).
@@ -77,7 +77,7 @@ func recordToRemoveAction(rc *models.RecordConfig) recordAction {
 func nativeToRecordConfig(origin string, rr *nativeRR, ttl uint32) (*models.RecordConfig, error) {
 	rc := &models.RecordConfig{Type: rr.Rectype, TTL: ttl, Original: rr}
 	rc.SetLabel(rr.Subname, origin)
-	prio, _ := strconv.ParseUint(rr.Prio, 10, 16)
+	prio, _ := strconv.ParseUint(string(rr.Prio), 10, 16)
 
 	var err error
 	switch rr.Rectype {
