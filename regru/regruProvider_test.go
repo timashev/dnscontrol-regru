@@ -80,6 +80,69 @@ func TestListZones(t *testing.T) {
 	}
 }
 
+// REG.API returns IDN dnames in Unicode; dnscontrol compares punycode, so
+// ListZones must return ASCII/punycode regardless of the wire form.
+func TestListZonesReturnsPunycode(t *testing.T) {
+	const resp = `{"answer":{"services":[
+		{"dname":"test.ru","servtype":"domain","state":"A"},
+		{"dname":"каталог.рф","servtype":"domain","state":"A"},
+		{"dname":"xn--e1afmkfd.xn--p1ai","servtype":"domain","state":"A"}
+	]},"result":"success"}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(resp))
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL)
+	zones, err := p.ListZones()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unicode -> punycode; already-punycode passes through; sorted.
+	want := []string{"test.ru", "xn--80aajzhsz.xn--p1ai", "xn--e1afmkfd.xn--p1ai"}
+	if len(zones) != len(want) {
+		t.Fatalf("zones = %v, want %v", zones, want)
+	}
+	for i := range want {
+		if zones[i] != want[i] {
+			t.Errorf("zones[%d] = %q, want %q", i, zones[i], want[i])
+		}
+	}
+}
+
+// A dname that fails punycode conversion is kept as-is and warned about, never
+// silently dropped.
+func TestListZonesConversionFailureKeepsOriginal(t *testing.T) {
+	const resp = `{"answer":{"services":[
+		{"dname":"test.ru","servtype":"domain","state":"A"},
+		{"dname":"xn--@@@.ru","servtype":"domain","state":"A"}
+	]},"result":"success"}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(resp))
+	}))
+	defer srv.Close()
+
+	buf := &bytes.Buffer{}
+	old := printer.DefaultPrinter
+	printer.DefaultPrinter = &printer.ConsolePrinter{Writer: buf}
+	defer func() { printer.DefaultPrinter = old }()
+
+	p := newTestProvider(t, srv.URL)
+	zones, err := p.ListZones()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"test.ru", "xn--@@@.ru"} // original kept, sorted
+	if len(zones) != len(want) || zones[0] != want[0] || zones[1] != want[1] {
+		t.Errorf("zones = %v, want %v", zones, want)
+	}
+	if !strings.Contains(buf.String(), "xn--@@@.ru") {
+		t.Errorf("expected a warning mentioning the un-convertible zone, got %q", buf.String())
+	}
+}
+
 func TestGetZoneRecords(t *testing.T) {
 	// Exact envelope captured from the live test/test account.
 	const resp = `{"answer":{"domains":[{"dname":"test.ru","result":"success","rrs":[{"content":"111.222.111.222","prio":"0","rectype":"A","state":"A","subname":"www"}],"service_id":12345,"servtype":"domain","soa":{"minimum_ttl":"12h","ttl":"1d"}}]},"charset":"utf-8","messagestore":null,"result":"success"}`

@@ -10,6 +10,7 @@ import (
 	"github.com/DNSControl/dnscontrol/v4/pkg/diff2"
 	"github.com/DNSControl/dnscontrol/v4/pkg/printer"
 	"github.com/DNSControl/dnscontrol/v4/pkg/providers"
+	"golang.org/x/net/idna"
 )
 
 const providerName = "REGRU"
@@ -84,9 +85,20 @@ func (p *regruProvider) ListZones() ([]string, error) {
 	}
 	var zones []string
 	for _, s := range svcs {
-		if s.Servtype == "domain" {
-			zones = append(zones, s.DName)
+		if s.Servtype != "domain" {
+			continue
 		}
+		// REG.API returns IDN dnames in Unicode, but dnscontrol punycodes every
+		// dc.Name (models.DomainConfig.Punycode uses idna.ToASCII) before the
+		// zone-existence compare — so return punycode here to make both sides
+		// agree. idna.ToASCII is idempotent on already-ASCII names. On failure,
+		// keep the original name (never drop a zone) and warn once.
+		name, err := idna.ToASCII(s.DName)
+		if err != nil {
+			printer.Warnf("REGRU: could not convert zone name %q to punycode (%v); listing it unchanged\n", s.DName, err)
+			name = s.DName
+		}
+		zones = append(zones, name)
 	}
 	sort.Strings(zones)
 	return zones, nil

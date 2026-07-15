@@ -125,6 +125,10 @@ processed serially.
 
 ## Limitations
 
+- **IDN (internationalized) zones** such as `.рф` domains are supported. REG.API
+  lists them in Unicode, but the provider returns them as punycode (`xn--*`) to
+  match dnscontrol's own normalization, so `preview`/`push` work with the
+  punycode name.
 - **TTL is zone-wide, not per-record.** REG.RU has no per-record TTLs — one TTL
   (the SOA TTL) applies to the whole zone. The provider manages it: when all of
   a zone's records share one TTL that differs from the live zone TTL, one
