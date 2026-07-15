@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -444,6 +445,34 @@ func (c *regruClient) updateRecords(dname string, actions []recordAction) error 
 		if a.Result != "success" {
 			return fmt.Errorf("regru: zone/update_records: %s: action %s: %s: %s", dname, a.Action, a.ErrorCode, a.ErrorText)
 		}
+	}
+	return nil
+}
+
+type updateSOARequest struct {
+	Domains []domainRef `json:"domains"`
+	TTL     string      `json:"ttl"`
+}
+
+// updateSOA sets the zone-wide cache TTL via zone/update_soa (client-tier).
+// REG.RU has no per-record TTL, so this is how a TTL change is applied.
+// ttlSeconds is sent as a string of seconds; minimum_ttl is left untouched
+// (verified optional against test/test on 2026-07-15).
+func (c *regruClient) updateSOA(dname string, ttlSeconds uint32) error {
+	in := updateSOARequest{
+		Domains: []domainRef{{DName: dname}},
+		TTL:     strconv.FormatUint(uint64(ttlSeconds), 10),
+	}
+	var out zoneOpResponse
+	if err := c.apiCall("zone/update_soa", in, &out, retryRateLimitOnly); err != nil {
+		return err
+	}
+	if len(out.Domains) == 0 {
+		return fmt.Errorf("regru: zone/update_soa: no data returned for %q", dname)
+	}
+	d := out.Domains[0]
+	if d.Result != "success" {
+		return fmt.Errorf("regru: zone/update_soa: %s: %s: %s", dname, d.ErrorCode, d.ErrorText)
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/DNSControl/dnscontrol/v4/models"
 	"github.com/DNSControl/dnscontrol/v4/pkg/diff2"
+	"github.com/DNSControl/dnscontrol/v4/pkg/printer"
 	"github.com/DNSControl/dnscontrol/v4/pkg/providers"
 )
 
@@ -133,11 +134,16 @@ func (p *regruProvider) GetZoneRecordsCorrections(dc *models.DomainConfig, exist
 	dc.Records = dropApexNS(dc.Records)
 
 	// REG.RU has no per-record TTL. Equalize desired TTLs to the zone TTL so a
-	// TTL difference alone never produces a correction.
+	// TTL difference alone never produces a record correction.
 	zoneTTL := defaultZoneTTL
 	if len(existing) > 0 {
 		zoneTTL = existing[0].TTL
 	}
+
+	// The zone-wide TTL is managed separately, via zone/update_soa. Decide this
+	// BEFORE normalizing desired TTLs (normalization erases the signal).
+	soaCorr := p.soaCorrection(dc, zoneTTL)
+
 	for _, rec := range dc.Records {
 		rec.TTL = zoneTTL
 	}
@@ -148,6 +154,11 @@ func (p *regruProvider) GetZoneRecordsCorrections(dc *models.DomainConfig, exist
 	}
 
 	var corrections []*models.Correction
+	// The SOA (zone-TTL) correction runs ahead of the record corrections.
+	if soaCorr != nil {
+		corrections = append(corrections, soaCorr)
+		actualChangeCount++
+	}
 	var deletes, replaces, creates []recordChange
 
 	for _, ch := range changes {
@@ -193,6 +204,52 @@ func (p *regruProvider) GetZoneRecordsCorrections(dc *models.DomainConfig, exist
 	}
 
 	return corrections, actualChangeCount, nil
+}
+
+// uniformDesiredTTL reports the single TTL shared by every record, or ok=false
+// if the set is empty or the TTLs differ.
+func uniformDesiredTTL(records models.Records) (uint32, bool) {
+	if len(records) == 0 {
+		return 0, false
+	}
+	ttl := records[0].TTL
+	for _, r := range records[1:] {
+		if r.TTL != ttl {
+			return 0, false
+		}
+	}
+	return ttl, true
+}
+
+// soaCorrection returns a correction that sets the zone-wide TTL when every
+// desired record shares one TTL that differs from the live zone TTL. It returns
+// nil (and warns once) when TTLs are mixed, and nil for an empty desired set or
+// when the desired TTL already matches. dc.Records must still carry their
+// dnsconfig TTLs (call before normalization).
+func (p *regruProvider) soaCorrection(dc *models.DomainConfig, currentTTL uint32) *models.Correction {
+	if len(dc.Records) == 0 {
+		return nil // never touch the SOA for a zone with no desired records
+	}
+	desiredTTL, uniform := uniformDesiredTTL(dc.Records)
+	if !uniform {
+		printer.Warnf("REGRU: %s has mixed record TTLs; REG.RU manages a single zone-wide TTL, so the zone TTL is left unchanged.\n", dc.Name)
+		return nil
+	}
+	// Defense-in-depth: dnscontrol normalizes TTL 0 -> DefaultTTL (300) upstream
+	// (pkg/normalize/validate.go), so 0 is unreachable today. But zone/update_soa
+	// is a destructive live write and that invariant lives in a pinned external
+	// dependency, so never drive an SOA write from an unset (0) TTL.
+	if desiredTTL == 0 {
+		return nil
+	}
+	if desiredTTL == currentTTL {
+		return nil
+	}
+	dname := dc.Name
+	return &models.Correction{
+		Msg: fmt.Sprintf("REGRU: update zone TTL %d → %d (zone/update_soa)", currentTTL, desiredTTL),
+		F:   func() error { return p.updateSOA(dname, desiredTTL) },
+	}
 }
 
 // perRecordCorrections emits one correction per change; each executes its

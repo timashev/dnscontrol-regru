@@ -405,3 +405,45 @@ func TestAPICallTransportErrorRetryByPolicy(t *testing.T) {
 		}
 	})
 }
+
+func TestUpdateSOA(t *testing.T) {
+	var gotPath, gotInputData string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_ = r.ParseForm()
+		gotInputData = r.Form.Get("input_data")
+		_, _ = w.Write([]byte(`{"answer":{"domains":[{"dname":"test.ru","result":"success","service_id":12345}]},"result":"success"}`))
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	if err := c.updateSOA("test.ru", 3600); err != nil {
+		t.Fatalf("updateSOA: %v", err)
+	}
+	if gotPath != "/zone/update_soa" {
+		t.Errorf("path = %q, want /zone/update_soa", gotPath)
+	}
+	// Seconds sent as a string; minimum_ttl untouched (not sent).
+	if want := `{"domains":[{"dname":"test.ru"}],"ttl":"3600"}`; gotInputData != want {
+		t.Errorf("input_data = %q, want %q", gotInputData, want)
+	}
+}
+
+// update_soa is a write: it must not retry on 5xx (a lost response may mean the
+// TTL was already changed).
+func TestUpdateSOANoRetryOn5xx(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	if err := c.updateSOA("test.ru", 3600); err == nil {
+		t.Fatal("expected error for update_soa + 502")
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("calls = %d, want 1 (writes must not retry on 5xx)", n)
+	}
+}

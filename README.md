@@ -18,6 +18,8 @@ is no plugin system). This repo therefore ships two things:
 - **DNS service provider** — read and apply record corrections.
 - **Registrar** — sync nameserver delegation (`domain/update_nss`).
 - **Record types**: A, AAAA, CNAME, MX, NS, TXT, SRV, CAA.
+- **Zone-wide TTL** — managed via `zone/update_soa` when all of a zone's records
+  share one TTL (REG.RU has no per-record TTLs).
 - Built-in client-side rate limiting and retry/backoff for REG.API's limits.
 
 ## Quick start
@@ -123,9 +125,13 @@ already applied. Zones are processed serially.
 
 ## Limitations
 
-- **TTL is not manageable.** REG.RU DNS uses a fixed per-zone TTL; the zone
-  functions carry no per-record TTL. Existing records are reported with the
-  zone TTL, and TTL differences never produce a correction.
+- **TTL is zone-wide, not per-record.** REG.RU has no per-record TTLs — a single
+  TTL applies to the whole zone (the SOA TTL). The provider manages that
+  zone-wide TTL: when **all** of a zone's records share one TTL that differs from
+  the live zone TTL, `preview`/`push` emits one `zone/update_soa` correction to
+  set it. If records carry **mixed** TTLs the zone TTL is left unchanged and a
+  warning is printed (pick one TTL for the whole zone). Per-record TTL
+  differences never produce a per-record correction.
 - **Apex NS records are not manageable.** REG.RU's nameserver set is fixed and
   managed by REG.RU; in-zone apex `NS` records are ignored by the diff.
   Nameserver delegation is handled by the **registrar** role

@@ -8,7 +8,8 @@ jsId: REGRU
 
 This is the provider for [REG.RU](https://www.reg.ru/), using
 [REG.API v2](https://www.reg.ru/support/help/api2). It acts as both a DNS
-service provider and a registrar (nameserver delegation).
+service provider and a registrar (nameserver delegation), and manages the
+zone-wide TTL (REG.RU has no per-record TTLs) via `zone/update_soa`.
 
 ## Configuration
 
@@ -124,9 +125,12 @@ processed serially.
 
 ## Limitations
 
-- **TTL is not manageable.** REG.RU DNS uses a fixed per-zone TTL; the API
-  carries no per-record TTL. Records are reported with the zone TTL and TTL
-  differences never produce a correction.
+- **TTL is zone-wide, not per-record.** REG.RU has no per-record TTLs — one TTL
+  (the SOA TTL) applies to the whole zone. The provider manages it: when all of
+  a zone's records share one TTL that differs from the live zone TTL, one
+  `zone/update_soa` correction is emitted to set it. Mixed TTLs leave the zone
+  TTL unchanged and print a warning. Per-record TTL differences never produce a
+  per-record correction. `minimum_ttl` and other SOA fields are not managed.
 - **In-zone apex `NS` records are not manageable.** REG.RU's nameserver set is
   fixed and managed by REG.RU; apex `NS` records are ignored by the record diff.
   Delegation is handled by the registrar role (`domain/update_nss`). Subdomain
