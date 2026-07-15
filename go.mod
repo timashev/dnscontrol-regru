@@ -2,6 +2,8 @@ module github.com/timashev/dnscontrol-regru
 
 go 1.26
 
+toolchain go1.26.5
+
 require (
 	github.com/DNSControl/dnscontrol/v4 v4.42.0
 	github.com/fatih/color v1.19.0
