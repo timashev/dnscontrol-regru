@@ -260,7 +260,23 @@ func (p *regruProvider) soaCorrection(dc *models.DomainConfig, currentTTL uint32
 	dname := dc.Name
 	return &models.Correction{
 		Msg: fmt.Sprintf("REGRU: update zone TTL %d → %d (zone/update_soa)", currentTTL, desiredTTL),
-		F:   func() error { return p.updateSOA(dname, desiredTTL) },
+		F: func() error {
+			// zone/update_soa requires minimum_ttl (real zones reject its
+			// absence with NO_PARAM). Read the current SOA at execution time —
+			// this runs on push only, never on preview (F is not executed), so
+			// it adds no preview cost — and cap the negative-cache TTL at the
+			// new zone TTL. Policy: never RAISE minimum_ttl; lower it only when
+			// it exceeds the new zone TTL, preserving deliberately low values.
+			// Degradation: an unparseable/absent minimum parses to
+			// defaultZoneTTL (86400) and is then capped to desiredTTL, so a bad
+			// read can never write a raised or garbage minimum.
+			dom, err := p.getResourceRecords(dname)
+			if err != nil {
+				return err
+			}
+			cur := parseRegruTTL(string(dom.SOA.MinimumTTL))
+			return p.updateSOA(dname, desiredTTL, min(cur, desiredTTL))
+		},
 	}
 }
 

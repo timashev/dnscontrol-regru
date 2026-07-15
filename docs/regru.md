@@ -134,7 +134,13 @@ processed serially.
   a zone's records share one TTL that differs from the live zone TTL, one
   `zone/update_soa` correction is emitted to set it. Mixed TTLs leave the zone
   TTL unchanged and print a warning. Per-record TTL differences never produce a
-  per-record correction. `minimum_ttl` and other SOA fields are not managed.
+  per-record correction.
+- **Negative-caching TTL (`minimum_ttl`).** `zone/update_soa` requires
+  `minimum_ttl`, so when the connector updates the zone TTL it also sets
+  `minimum_ttl`, capped at the new zone TTL: an existing value ≤ the new zone
+  TTL is preserved, a larger one is lowered to the zone TTL. It is never raised
+  and never managed independently (it only changes when the zone TTL changes).
+  Other SOA fields (serial, refresh, retry, expire) are not managed.
 - **In-zone apex `NS` records are not manageable.** REG.RU's nameserver set is
   fixed and managed by REG.RU; apex `NS` records are ignored by the record diff.
   Delegation is handled by the registrar role (`domain/update_nss`). Subdomain

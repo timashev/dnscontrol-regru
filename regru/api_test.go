@@ -417,15 +417,34 @@ func TestUpdateSOA(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t, srv.URL)
-	if err := c.updateSOA("test.ru", 3600); err != nil {
+	if err := c.updateSOA("test.ru", 3600, 3600); err != nil {
 		t.Fatalf("updateSOA: %v", err)
 	}
 	if gotPath != "/zone/update_soa" {
 		t.Errorf("path = %q, want /zone/update_soa", gotPath)
 	}
-	// Seconds sent as a string; minimum_ttl untouched (not sent).
-	if want := `{"domains":[{"dname":"test.ru"}],"ttl":"3600"}`; gotInputData != want {
+	// ttl and minimum_ttl are both sent as the same seconds string: the
+	// zone-wide TTL governs positive and negative caching alike.
+	if want := `{"domains":[{"dname":"test.ru"}],"ttl":"3600","minimum_ttl":"3600"}`; gotInputData != want {
 		t.Errorf("input_data = %q, want %q", gotInputData, want)
+	}
+}
+
+// A real zone rejects update_soa without minimum_ttl (NO_PARAM, empty text);
+// the error must surface verbatim with no dangling trailing colon.
+func TestUpdateSOANoParamError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"answer":{"domains":[{"dname":"test.ru","result":"error","error_code":"NO_PARAM","error_text":""}]},"result":"success"}`))
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	err := c.updateSOA("test.ru", 3600, 3600)
+	if err == nil {
+		t.Fatal("expected NO_PARAM error")
+	}
+	if want := "regru: zone/update_soa: test.ru: NO_PARAM"; err.Error() != want {
+		t.Errorf("error = %q, want %q (no trailing colon)", err.Error(), want)
 	}
 }
 
@@ -440,7 +459,7 @@ func TestUpdateSOANoRetryOn5xx(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t, srv.URL)
-	if err := c.updateSOA("test.ru", 3600); err == nil {
+	if err := c.updateSOA("test.ru", 3600, 3600); err == nil {
 		t.Fatal("expected error for update_soa + 502")
 	}
 	if n := calls.Load(); n != 1 {

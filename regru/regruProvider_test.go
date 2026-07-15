@@ -552,14 +552,15 @@ func TestGetZoneRecordsCorrectionsSOA(t *testing.T) {
 		existing := buildExisting(t, origin, &nativeRR{Subname: "www", Rectype: "A", Content: "1.2.3.4", Prio: "0"})
 		dc := &models.DomainConfig{Name: origin, Records: models.Records{desiredA(origin, "www", "1.2.3.4", 7200)}}
 
-		var gotPath, gotTTL string
+		var gotPath, gotTTL, gotMinTTL string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			gotPath = r.URL.Path
 			var in struct {
-				TTL string `json:"ttl"`
+				TTL        string `json:"ttl"`
+				MinimumTTL string `json:"minimum_ttl"`
 			}
 			decodeInputData(t, r, &in)
-			gotTTL = in.TTL
+			gotTTL, gotMinTTL = in.TTL, in.MinimumTTL
 			_, _ = w.Write([]byte(`{"answer":{"domains":[{"dname":"example.com","result":"success"}]},"result":"success"}`))
 		}))
 		defer srv.Close()
@@ -579,8 +580,10 @@ func TestGetZoneRecordsCorrectionsSOA(t *testing.T) {
 			t.Errorf("SOA correction Msg = %q", corrections[0].Msg)
 		}
 		runCorrections(t, corrections)
-		if gotPath != "/zone/update_soa" || gotTTL != "7200" {
-			t.Errorf("update_soa call: path=%q ttl=%q, want /zone/update_soa 7200", gotPath, gotTTL)
+		// F reads the SOA (empty minimum here -> 86400) then writes update_soa
+		// with minimum_ttl capped to the desired TTL. gotPath is the last call.
+		if gotPath != "/zone/update_soa" || gotTTL != "7200" || gotMinTTL != "7200" {
+			t.Errorf("update_soa call: path=%q ttl=%q minimum_ttl=%q, want /zone/update_soa 7200 7200", gotPath, gotTTL, gotMinTTL)
 		}
 	})
 
@@ -679,4 +682,103 @@ func TestGetZoneRecordsCorrectionsSOA(t *testing.T) {
 			t.Errorf("expected no warning for uniform TTL 0, got %q", buf.String())
 		}
 	})
+}
+
+// The SOA correction's F reads the current SOA (get_resource_records) at push
+// time and caps minimum_ttl at the new zone TTL: min(current, desired). Never
+// raised; lowered only when it exceeds the new zone TTL; low values preserved;
+// unparseable/absent falls back to defaultZoneTTL and is then capped.
+func TestSOACorrectionCapsMinimumTTL(t *testing.T) {
+	const origin = "example.com"
+	const desired = uint32(7200) // existing zone TTL is 3600 (buildExisting)
+
+	cases := []struct {
+		name      string
+		soaMinTTL string // what get_resource_records reports for soa.minimum_ttl
+		wantMin   string // expected minimum_ttl posted to update_soa
+	}{
+		{"greater than desired capped down", "1d", "7200"}, // 86400 -> 7200
+		{"lower than desired preserved", "600", "600"},
+		{"equal preserved", "7200", "7200"},
+		{"unparseable falls back then capped", "garbage", "7200"}, // 86400 -> 7200
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			existing := buildExisting(t, origin, &nativeRR{Subname: "www", Rectype: "A", Content: "1.2.3.4", Prio: "0"})
+			dc := &models.DomainConfig{Name: origin, Records: models.Records{desiredA(origin, "www", "1.2.3.4", desired)}}
+
+			var paths []string
+			var gotTTL, gotMin string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+				switch r.URL.Path {
+				case "/zone/get_resource_records":
+					_, _ = w.Write([]byte(`{"answer":{"domains":[{"dname":"example.com","result":"success","rrs":[],"soa":{"ttl":"3600","minimum_ttl":"` + tc.soaMinTTL + `"}}]},"result":"success"}`))
+				case "/zone/update_soa":
+					var in struct {
+						TTL        string `json:"ttl"`
+						MinimumTTL string `json:"minimum_ttl"`
+					}
+					decodeInputData(t, r, &in)
+					gotTTL, gotMin = in.TTL, in.MinimumTTL
+					_, _ = w.Write([]byte(`{"answer":{"domains":[{"dname":"example.com","result":"success"}]},"result":"success"}`))
+				default:
+					t.Errorf("unexpected path %q", r.URL.Path)
+				}
+			}))
+			defer srv.Close()
+
+			p := newTestProvider(t, srv.URL)
+			corrections, count, err := p.GetZoneRecordsCorrections(dc, existing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 || len(corrections) != 1 {
+				t.Fatalf("want 1 SOA correction; got count=%d corrections=%d", count, len(corrections))
+			}
+			runCorrections(t, corrections)
+
+			if len(paths) != 2 || paths[0] != "/zone/get_resource_records" || paths[1] != "/zone/update_soa" {
+				t.Errorf("request sequence = %v, want [get_resource_records update_soa]", paths)
+			}
+			if gotTTL != "7200" || gotMin != tc.wantMin {
+				t.Errorf("update_soa ttl=%q minimum_ttl=%q, want ttl=7200 minimum_ttl=%q", gotTTL, gotMin, tc.wantMin)
+			}
+		})
+	}
+}
+
+// If the execution-time SOA fetch fails, the correction fails cleanly and
+// update_soa is never called (next run retries).
+func TestSOACorrectionFetchErrorNoWrite(t *testing.T) {
+	const origin = "example.com"
+	existing := buildExisting(t, origin, &nativeRR{Subname: "www", Rectype: "A", Content: "1.2.3.4", Prio: "0"})
+	dc := &models.DomainConfig{Name: origin, Records: models.Records{desiredA(origin, "www", "1.2.3.4", 7200)}}
+
+	var updateCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/zone/get_resource_records":
+			_, _ = w.Write([]byte(`{"answer":{"domains":[{"dname":"example.com","result":"error","error_code":"SERVICE_NOT_FOUND","error_text":"gone"}]},"result":"success"}`))
+		case "/zone/update_soa":
+			updateCalls.Add(1)
+			_, _ = w.Write([]byte(`{"answer":{"domains":[{"dname":"example.com","result":"success"}]},"result":"success"}`))
+		}
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL)
+	corrections, _, err := p.GetZoneRecordsCorrections(dc, existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(corrections) != 1 {
+		t.Fatalf("want 1 SOA correction, got %d", len(corrections))
+	}
+	if err := corrections[0].F(); err == nil {
+		t.Fatal("expected the correction to fail when the SOA fetch fails")
+	}
+	if updateCalls.Load() != 0 {
+		t.Errorf("update_soa called %d times despite fetch error, want 0", updateCalls.Load())
+	}
 }

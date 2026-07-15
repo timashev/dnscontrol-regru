@@ -329,7 +329,7 @@ func (c *regruClient) getResourceRecords(dname string) (*domainRecords, error) {
 		if d.ErrorCode == errDomainNotFound || d.ErrorCode == errServiceNotFound {
 			return nil, fmt.Errorf("regru: zone %q has no DNS-hosting service on this REG.RU account (%s: %s): create the DNS hosting service for the domain in the REG.RU control panel, or verify the account owns the domain, then re-run", dname, d.ErrorCode, d.ErrorText)
 		}
-		return nil, fmt.Errorf("regru: zone/get_resource_records: %s: %s: %s", dname, d.ErrorCode, d.ErrorText)
+		return nil, fmt.Errorf("regru: zone/get_resource_records: %s: %s", dname, codeText(d.ErrorCode, d.ErrorText))
 	}
 	return &d, nil
 }
@@ -371,6 +371,16 @@ type zoneOpResponse struct {
 	} `json:"domains"`
 }
 
+// codeText joins a REG.API error code and its text, dropping the ": " separator
+// when the text is empty. Some codes (e.g. NO_PARAM) carry no text, which would
+// otherwise render a dangling "CODE: ".
+func codeText(code, text string) string {
+	if text == "" {
+		return code
+	}
+	return code + ": " + text
+}
+
 // applyRecordAction executes a single action as an individual client-tier call
 // to zone/<action> (e.g. zone/add_alias, zone/remove_record). The record fields
 // are sent as top-level input_data siblings of "domains".
@@ -392,7 +402,7 @@ func (c *regruClient) applyRecordAction(dname string, act recordAction) error {
 	}
 	d := out.Domains[0]
 	if d.Result != "success" {
-		return fmt.Errorf("regru: %s: %s: %s: %s", fn, dname, d.ErrorCode, d.ErrorText)
+		return fmt.Errorf("regru: %s: %s: %s", fn, dname, codeText(d.ErrorCode, d.ErrorText))
 	}
 	return nil
 }
@@ -439,29 +449,33 @@ func (c *regruClient) updateRecords(dname string, actions []recordAction) error 
 	}
 	d := out.Domains[0]
 	if d.Result == "error" || d.ErrorCode != "" {
-		return fmt.Errorf("regru: zone/update_records: %s: %s: %s", dname, d.ErrorCode, d.ErrorText)
+		return fmt.Errorf("regru: zone/update_records: %s: %s", dname, codeText(d.ErrorCode, d.ErrorText))
 	}
 	for _, a := range d.ActionList {
 		if a.Result != "success" {
-			return fmt.Errorf("regru: zone/update_records: %s: action %s: %s: %s", dname, a.Action, a.ErrorCode, a.ErrorText)
+			return fmt.Errorf("regru: zone/update_records: %s: action %s: %s", dname, a.Action, codeText(a.ErrorCode, a.ErrorText))
 		}
 	}
 	return nil
 }
 
 type updateSOARequest struct {
-	Domains []domainRef `json:"domains"`
-	TTL     string      `json:"ttl"`
+	Domains    []domainRef `json:"domains"`
+	TTL        string      `json:"ttl"`
+	MinimumTTL string      `json:"minimum_ttl"`
 }
 
 // updateSOA sets the zone-wide cache TTL via zone/update_soa (client-tier).
-// REG.RU has no per-record TTL, so this is how a TTL change is applied.
-// ttlSeconds is sent as a string of seconds; minimum_ttl is left untouched
-// (verified optional against test/test on 2026-07-15).
-func (c *regruClient) updateSOA(dname string, ttlSeconds uint32) error {
+// REG.RU has no per-record TTL, so this is how a TTL change is applied. Both
+// ttl and minimum_ttl are sent as strings of seconds. minimum_ttl is mandatory
+// on real zones (test/test tolerates its absence, but a real zone rejects the
+// request with NO_PARAM, observed live 2026-07-15). This is a pure API call —
+// the caller decides the minimum_ttl value.
+func (c *regruClient) updateSOA(dname string, ttlSeconds, minimumTTLSeconds uint32) error {
 	in := updateSOARequest{
-		Domains: []domainRef{{DName: dname}},
-		TTL:     strconv.FormatUint(uint64(ttlSeconds), 10),
+		Domains:    []domainRef{{DName: dname}},
+		TTL:        strconv.FormatUint(uint64(ttlSeconds), 10),
+		MinimumTTL: strconv.FormatUint(uint64(minimumTTLSeconds), 10),
 	}
 	var out zoneOpResponse
 	if err := c.apiCall("zone/update_soa", in, &out, retryRateLimitOnly); err != nil {
@@ -472,7 +486,7 @@ func (c *regruClient) updateSOA(dname string, ttlSeconds uint32) error {
 	}
 	d := out.Domains[0]
 	if d.Result != "success" {
-		return fmt.Errorf("regru: zone/update_soa: %s: %s: %s", dname, d.ErrorCode, d.ErrorText)
+		return fmt.Errorf("regru: zone/update_soa: %s: %s", dname, codeText(d.ErrorCode, d.ErrorText))
 	}
 	return nil
 }

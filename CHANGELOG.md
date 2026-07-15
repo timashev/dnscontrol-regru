@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-07-15
+
+### Fixed
+
+- `zone/update_soa` now sends `minimum_ttl` (required on real zones; its absence
+  fails with `NO_PARAM`). The connector reads the zone's current `minimum_ttl`
+  and sends it capped at the new zone TTL — `min(current, new TTL)` — so
+  negative-caching is never raised, only lowered when it exceeds the new zone
+  TTL, and deliberately low values are preserved.
+- Zone-operation error messages no longer leave a dangling `: ` when the API
+  returns an error code with empty text (e.g. `NO_PARAM`).
+
 ## [1.1.1] - 2026-07-15
 
 ### Fixed
