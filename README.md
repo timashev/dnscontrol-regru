@@ -31,10 +31,19 @@ make build      # -> ./dnscontrol (REGRU + all stock providers compiled in)
 ```
 
 `make build` injects the version so `./dnscontrol version` reports
-`v4.42.0+regru`. A plain `go build ./cmd/dnscontrol` (or
+`<dnscontrol-release>+regru` (the base is read from `go.mod`, so it always
+matches the linked dnscontrol release). A plain `go build ./cmd/dnscontrol` (or
 `go install github.com/timashev/dnscontrol-regru/cmd/dnscontrol@latest`) also
 works; without the Makefile's `-ldflags`, the `version` subcommand shows the Go
 module version instead of the `+regru` marker.
+
+To install system-wide, `sudo make install` puts the binary in
+`/usr/local/bin` (override with `PREFIX=`), which deliberately shadows any
+distro/`.deb` dnscontrol in `/usr/bin`. Updating a deployment is:
+
+```sh
+git pull --ff-only && sudo make install && dnscontrol version
+```
 
 ### 2. Configure credentials
 
